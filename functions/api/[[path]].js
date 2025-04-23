@@ -294,172 +294,71 @@ async function handleLoginRequest(request, env) {
  * Processes user messages based on the current state stored in KV.
  * Manages the conversation history and interacts with the LLM.
  */
-async function handleChatRequest(request, env, userCode) {
+async function handleChatRequest(request, env) {
     console.log(`Handling chat request from: ${request.headers.get('CF-Connecting-IP')}`);
-    let requestPayload;
-    // Define standard Content-Type header for JSON responses inside this function scope
-    // Note: Ensure corsHeaders is accessible (defined globally or passed).
     const jsonHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
     try {
-        requestPayload = await request.json();
-        if (!requestPayload.code || !requestPayload.message) {
-            throw new Error("Missing 'code' or 'message' in request body");
-        }
-        console.log(`Chat request received for code ${requestPayload.code}`);
-    } catch (error) {
-        console.error('Error parsing chat request body:', error);
-        // Use local jsonHeaders
-        return new Response(JSON.stringify({ error: '无效的请求体' }), { status: 400, headers: jsonHeaders });
-    }
-
-    const { message: userMessage, code: loginCode } = requestPayload;
-
-    try {
-        // --- 1. Load Current State & History ---
-        console.log(`Loading state for ${loginCode} from KV...`);
-        const storedStateString = await env.KV_NAMESPACE.get(loginCode);
-
-        if (!storedStateString) {
-            console.error(`No state found in KV for code ${loginCode}. User might not be logged in properly.`);
-            // Use local jsonHeaders
-            return new Response(JSON.stringify({ error: '未找到会话状态，请尝试重新登录' }), { status: 404, headers: jsonHeaders });
+        // 1. 解析请求
+        const { code: loginCode, message: userMessage } = await request.json();
+        if (!loginCode || !userMessage) {
+            throw new Error("Missing required fields");
         }
 
-        let currentState;
-        try {
-            currentState = JSON.parse(storedStateString);
-             // {{ EDIT 1: Ensure conversation_history exists, initialize if not }}
-            if (!currentState || !Array.isArray(currentState.conversation_history)) {
-                 console.warn(`conversation_history missing or not an array for ${loginCode}. Initializing.`);
-                 // Initialize a minimal state if corrupted or missing history
-                 currentState = { conversation_history: [] };
-            }
-            console.log(`State for ${loginCode} loaded. History length: ${currentState.conversation_history?.length ?? 0}`);
-        } catch (parseError) {
-            console.error(`Error parsing stored state for ${loginCode} during chat:`, parseError);
-            // {{ EDIT 2: Return error if state cannot be parsed }}
-             return new Response(JSON.stringify({ error: '无法解析会话状态' }), { status: 500, headers: jsonHeaders });
-        }
+        // 2. 加载或初始化对话历史
+        const storedState = await env.KV_NAMESPACE.get(loginCode);
+        let conversationHistory = storedState ? JSON.parse(storedState).conversation_history : [];
+        
+        // 3. 添加用户消息
+        conversationHistory.push({ role: 'user', content: userMessage });
 
-        // --- 2. Append User Message to History ---
-        // Ensure currentState.conversation_history is always an array before pushing
-        if (!Array.isArray(currentState.conversation_history)) {
-            currentState.conversation_history = [];
-        }
-        currentState.conversation_history.push({ role: 'user', content: userMessage });
-        console.log(`Appended user message to history. New history length: ${currentState.conversation_history.length}`);
+        // 4. 准备LLM请求
+        const messages = [
+            { role: 'system', content: env.SYSTEM_PROMPT },
+            ...conversationHistory
+        ];
 
+        // 5. 调用LLM
+        const llmResponse = await fetch(`${env.API_ENDPOINT}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${env.OPENAI_API_KEY}`
+            },
+            body: JSON.stringify({
+                model: env.LLM_MODEL,
+                messages,
+                stream: false
+            }),
+        });
 
-        let aiReply = null; // Initialize AI reply variable
+        // 6. 处理响应
+        const llmData = await llmResponse.json();
+        const aiReply = llmData.choices[0].message.content.trim();
 
-        // --- 3. Prepare Prompts ---
-        const paperSystemPrompt = env.PAPER_SYSTEM_PROMPT; // 从 Secret 读取
-        const generalSystemPrompt = env.SYSTEM_PROMPT;    // 从 Plaintext 读取
+        // 7. 更新历史并保存
+        conversationHistory.push({ role: 'assistant', content: aiReply });
+        await env.KV_NAMESPACE.put(loginCode, JSON.stringify({ 
+            conversation_history: conversationHistory 
+        }));
 
-        if (!paperSystemPrompt || !generalSystemPrompt) {
-            console.error("错误：PAPER_SYSTEM_PROMPT 或 SYSTEM_PROMPT 环境变量未设置。请在 Cloudflare Dashboard 或 wrangler.toml 中进行配置。");
-            // 根据需要返回错误，确保 jsonHeaders 在此作用域内可用
-            return new Response(JSON.stringify({ error: '服务器配置错误：必要的系统提示缺失' }), {
-                status: 500,
-                headers: jsonHeaders // 假设 jsonHeaders 已在此作用域定义
-            });
-        }
-
-        // {{ EDIT 3: Simplify combined prompt - remove status }}
-        // 合并两个 Prompt 内容，不再包含动态状态
-        const combinedPromptContent = `${paperSystemPrompt}\n\n---\n\n${generalSystemPrompt}`;
-        const systemPrompt = { role: 'system', content: combinedPromptContent };
-
-        // Use the updated conversation history
-        const llmMessages = [ systemPrompt, ...currentState.conversation_history ];
-
-        // --- 4. Call LLM (Replaces State Machine Logic) ---
-        // Always call the LLM since the state machine is removed
-        console.log(`Calling LLM API. Endpoint: ${env.API_ENDPOINT}, Model: ${env.LLM_MODEL}`);
-        try {
-             const llmResponse = await fetch(`${env.API_ENDPOINT}/chat/completions`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${env.OPENAI_API_KEY}`
-                },
-                body: JSON.stringify({
-                    model: env.LLM_MODEL,
-                    messages: llmMessages, // Use the messages array built earlier
-                    stream: false
-                }),
-            });
-
-             if (!llmResponse.ok) {
-                 const errorBody = await llmResponse.text();
-                 console.error(`LLM API request failed with status ${llmResponse.status}: ${errorBody}`);
-                 throw new Error(`LLM API 错误 (${llmResponse.status})`);
-             }
-
-             const llmData = await llmResponse.json();
-             if (!llmData.choices || llmData.choices.length === 0 || !llmData.choices[0].message || !llmData.choices[0].message.content) {
-                 console.error("Invalid LLM response structure:", llmData);
-                 throw new Error("无效的 LLM 响应");
-             }
-
-             aiReply = llmData.choices[0].message.content.trim();
-             if (!aiReply) {
-                 console.warn("LLM returned an empty reply.");
-                 aiReply = "(AI 未返回有效内容)";
-             }
-             console.log("LLM processing successful.");
-
-             // {{ EDIT 4: Remove state update logic based on previous status }}
-             // // --- Update State based on LLM response ---  << REMOVED
-             // if (currentState.status === 'GENERATING_OUTLINE') { ... } << REMOVED
-             // } else if (currentState.status === 'GENERATING_CHAPTER') { ... } << REMOVED
-
-        } catch (llmError) {
-            console.error('Error during LLM API call:', llmError);
-            aiReply = `抱歉，在调用 AI 服务时出错: ${llmError.message}`;
-            // Consider reverting state if LLM fails? Or keep it as GENERATING?
-            // If keeping GENERATING, the next user message might retry.
-            // If reverting, need to decide which state to revert to (e.g., AWAITING_INITIAL_INPUT).
-            // For now, keeps state, returns error message.
-        }
-
-        // --- 5. Append AI Reply to History ---
-        if (aiReply !== null) {
-           // Append the valid AI reply (or error message from catch block)
-           currentState.conversation_history.push({ role: 'assistant', content: aiReply });
-           console.log(`Appended assistant message to history. New history length: ${currentState.conversation_history.length}`);
-        } else {
-           // This case should be less likely now unless the LLM call completely failed without setting aiReply in catch
-            console.warn(`LLM call finished but aiReply is still null.`);
-            aiReply = "内部处理错误，未能生成回复。"; // Provide a default error message
-            currentState.conversation_history.push({ role: 'assistant', content: aiReply });
-        }
-
-
-        // --- 6. Save Updated State (Primarily History) Back to KV ---
-        // {{ EDIT 5: Save only the conversation history directly }}
-        // We are now saving a simple object containing only the history.
-        const stateToSave = { conversation_history: currentState.conversation_history };
-        console.log(`Saving updated state (history only) for ${loginCode} to KV.`);
-        await env.KV_NAMESPACE.put(loginCode, JSON.stringify(stateToSave));
-        console.log(`State for ${loginCode} successfully saved.`);
-
-
-        // --- 7. Return Response to Frontend ---
-        // {{ EDIT 6: Simplify the response to only include the AI reply }}
-        return new Response(JSON.stringify({
-            reply: aiReply // Only send the AI reply
-        }), {
-            status: 200,
-            headers: jsonHeaders
+        // 8. 返回优化后的响应
+        return new Response(JSON.stringify({ 
+            success: true, 
+            reply: aiReply 
+        }), { 
+            status: 200, 
+            headers: jsonHeaders 
         });
 
     } catch (error) {
-        console.error(`Unhandled error in handleChatRequest for code ${loginCode}:`, error);
-        return new Response(JSON.stringify({ error: `服务器内部错误: ${error.message}` }), {
-            status: 500,
-            headers: jsonHeaders // Ensure headers are set on error
+        console.error('Chat request error:', error);
+        return new Response(JSON.stringify({ 
+            success: false, 
+            error: error.message 
+        }), { 
+            status: 500, 
+            headers: jsonHeaders 
         });
     }
 }
