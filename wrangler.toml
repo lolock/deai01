@@ -7,11 +7,11 @@ compatibility_date = "2025-04-06" # 保持或更新兼容性日期
 # [[kv_namespaces]] ... (保持你的 KV 绑定配置)
 [[kv_namespaces]]
 binding = "KV_NAMESPACE"
-id = "4dcd1b2c5cf94fbeb5fe79f53fdf6fc4" # 或者 preview_id
+id = "1807ae37a2c94916add2181d8a20125a" # 或者 preview_id
 
 # --- 生产环境变量 ---
 # 这些变量会在部署到 Cloudflare Pages 时生效
 [vars]
 API_ENDPOINT = "https://api.deepseek.com/v1" # 替换为你的生产 API Endpoint
 LLM_MODEL = "deepseek-reasoner"                     # 替换为你的生产模型名称
-SYSTEM_PROMPT = """先根据总字数要求和章节内容规划具体大纲结构和各章字数。对话内容只输出论文相关部分，且不要附加文献综述。""" # 你的生产系统提示
+SYSTEM_PROMPT = """不必输出思考过程，只需要输出优化结果。""" # 你的生产系统提示
